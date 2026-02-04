@@ -51,7 +51,7 @@ class KimiVLMoEModelProvider(MoonlightModelProvider16B):
     freeze_vision_model: bool = True
     # Whether to freeze vision-to-language projection weights
     freeze_vision_projection: bool = False
-
+    scatter_embedding_sequence_parallel: bool = False
 
     def finalize(self) -> None:
         if self.tensor_model_parallel_size > 1:
