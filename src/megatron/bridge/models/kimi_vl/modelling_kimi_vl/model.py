@@ -196,7 +196,7 @@ class KimiVLMultiModalProjector(MegatronModule):
             self.hidden_size,
             init_method=config.init_method,
             bias=True,
-            gather_output=True,
+            gather_output=False,
             skip_bias_add=False,
             config=config,
         )
@@ -210,7 +210,7 @@ class KimiVLMultiModalProjector(MegatronModule):
             config.hidden_size,
             init_method=config.init_method,
             bias=True,
-            input_is_parallel=False,
+            input_is_parallel=True,
             skip_bias_add=False,
             config=config,
         )
