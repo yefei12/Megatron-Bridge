@@ -1,4 +1,3 @@
-
 import logging
 from typing import Dict, Mapping, Union
 
@@ -15,6 +14,8 @@ from megatron.bridge.models.conversion.param_mapping import (
     GatedMLPMapping,
     QKVMapping,
     ReplicatedMapping,
+    RowParallelMapping,
+    ColumnParallelMapping
 )
 from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
 from megatron.bridge.models.kimi_vl.kimi_vl_provider import KimiVLMoEModelProvider
@@ -113,7 +114,6 @@ class KimiVLMoEBridge(MegatronModelBridge):
     def mapping_registry(self) -> MegatronMappingRegistry:
         """
         Return MegatronMappingRegistry containing parameter mappings for MoE models.
-
         The MoE mappings include:
         1. Standard language model mappings (embeddings, layer norms, output)
         2. Vision model mappings (same as dense model)
@@ -123,7 +123,6 @@ class KimiVLMoEBridge(MegatronModelBridge):
            - Expert MLPs (multiple experts per layer)
            - Pre-MLP layernorm
         5. Deepstack visual merger mappings
-
         Returns:
             MegatronMappingRegistry with all MoE parameter mappings
         """
@@ -162,14 +161,23 @@ class KimiVLMoEBridge(MegatronModelBridge):
 
         mapping_list.extend(
             [
-                # Vision tower and projector weights
+                # Vision tower
                 ReplicatedMapping(
                     megatron_param="vision_model.**",
                     hf_param="vision_tower.**",
                 ),
-                AutoMapping(
-                    megatron_param="multi_modal_projector.**",
-                    hf_param="multi_modal_projector.**",
+                # projector weights
+                ReplicatedMapping(
+                    megatron_param="multi_modal_projector.pre_norm.**",
+                    hf_param="multi_modal_projector.pre_norm.**",
+                ),
+                ColumnParallelMapping(
+                    megatron_param="multi_modal_projector.linear_1.**",
+                    hf_param="multi_modal_projector.linear_1.**",
+                ),
+                RowParallelMapping(
+                    megatron_param="multi_modal_projector.linear_2.**",
+                    hf_param="multi_modal_projector.linear_2.**",
                 ),
                 # Dense MLP mappings (for non-MoE layers)
                 GatedMLPMapping(
