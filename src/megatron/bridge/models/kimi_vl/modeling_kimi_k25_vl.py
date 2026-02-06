@@ -28,6 +28,8 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
 from megatron.bridge.utils.import_utils import safe_import_from
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core import InferenceParams, tensor_parallel
 
 
 TENorm, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TENorm")
@@ -85,6 +87,10 @@ class KimiK25VLModel(MegatronModule):
 
         if config.hf_model_path is None:
             raise ValueError("hf_model_path must be set.")
+
+        self.config.image_token_index: int = getattr(config, "image_token_index", 163605)
+        self.config.pad_token_id: int = getattr(config, "pad_token_id", 163839)
+        self.config.ignore_index: int = getattr(config, "ignore_index", -100)
         
         KimiK25ForConditionalGeneration = get_class_from_dynamic_module(
             "modeling_kimi_k25.KimiK25ForConditionalGeneration",
@@ -139,11 +145,14 @@ class KimiK25VLModel(MegatronModule):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
+        grid_thws: torch.Tensor = None,
+        image_input_mask: torch.Tensor = None,
         labels: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
-        *,
-        loss_mask: Optional[Tensor] = None,
+        loss_mask: torch.Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
     ) -> Tensor:
         r"""
         Args:
@@ -158,17 +167,22 @@ class KimiK25VLModel(MegatronModule):
             runtime_gather_output: If True, gather outputs across pipeline stages.
             loss_mask: Mask for loss computation.
         """
+        
+        if position_ids is None:
+            seq_len = input_ids.size(1)
+            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+
+        
         if self.pre_process:
             if inputs_embeds is None:
                 inputs_embeds = self.language_model.embedding(
                     input_ids=input_ids, position_ids=None
-                )  # [decoder_seq_len, b, h_language]
+                ).clone()  # [decoder_seq_len, b, h_language]
 
                 inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # [b, decoder_seq_len, h_language]
 
-            breakpoint()
             if pixel_values is not None:
-                image_features = self._extract_image_features(pixel_values, image_grid_thw)
+                image_features = self._extract_image_features(pixel_values.to(self.vision_tower.dtype), grid_thws)
                 image_features = self.mm_projector(image_features)
                 inputs_embeds = inputs_embeds.to(image_features[0].dtype)
                 inputs_embeds, attention_mask, labels, position_ids = (
@@ -180,7 +194,10 @@ class KimiK25VLModel(MegatronModule):
                         labels,
                     ))
 
-            inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # (B, T, D) -> (T, B, D)
+            
+            if self.config.sequence_parallel:
+                inputs_embeds = tensor_parallel.scatter_to_sequence_parallel_region(inputs_embeds)
+                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # (B, T, D) -> (T, B, D)
 
         attention_mask = self._compute_attention_mask(input_ids)
 
@@ -190,8 +207,10 @@ class KimiK25VLModel(MegatronModule):
             attention_mask=attention_mask,  # (B, 1, T, T)
             decoder_input=inputs_embeds,  # (T, B, D)
             labels=labels,  # (B, T)
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
             loss_mask=loss_mask,
-            runtime_gather_output=runtime_gather_output,
+            **(extra_block_kwargs or {}),
         )
         return outputs
 
@@ -235,7 +254,7 @@ class KimiK25VLModel(MegatronModule):
         batch_size, seq_len = input_ids.shape
         causal_mask = torch.tril(torch.ones((batch_size, 1, seq_len, seq_len))).to(input_ids.device)
 
-        image_mask = input_ids == self.config.image_token_id
+        image_mask = input_ids == self.config.image_token_index
         padded_mask = F.pad(image_mask, (1, 0), value=0)
         boundary = padded_mask[:, 1:] > padded_mask[:, :-1]
         numbered_boundary = torch.cumsum(boundary, dim=-1)

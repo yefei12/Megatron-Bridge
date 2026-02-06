@@ -78,9 +78,6 @@ class KimiVLMoEBridge(MegatronModelBridge):
         
         vision_config = hf_config.vision_config
         vision_config.torch_dtype = model_dtype
-        
-        # breakpoint()
-        
 
         provider = KimiVLMoEModelProvider(
             # Language model configuration from text_config
