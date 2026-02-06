@@ -197,7 +197,8 @@ class KimiK25VLModel(MegatronModule):
             
             if self.config.sequence_parallel:
                 inputs_embeds = tensor_parallel.scatter_to_sequence_parallel_region(inputs_embeds)
-                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # (B, T, D) -> (T, B, D)
+                inputs_embeds = inputs_embeds.contiguous()
+
 
         attention_mask = self._compute_attention_mask(input_ids)
 
