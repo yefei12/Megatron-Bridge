@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -185,22 +186,114 @@ class KimiK25VLModel(MegatronModule):
                 image_features = self._extract_image_features(pixel_values.to(self.vision_tower.dtype), grid_thws)
                 image_features = self.mm_projector(image_features)
                 inputs_embeds = inputs_embeds.to(image_features[0].dtype)
-                inputs_embeds, attention_mask, labels, position_ids = (
-                    self._merge_input_ids_with_image_features(
-                        image_features,
-                        inputs_embeds,
-                        input_ids,
-                        attention_mask,
-                        labels,
-                    ))
+
+                # Create backup of original inputs
+                original_inputs_embeds = inputs_embeds
+                original_attention_mask = attention_mask
+                original_labels = labels
+                original_position_ids = position_ids
+
+                # Check if image token count matches image feature count
+                if input_ids is not None:
+                    total_image_tokens = (input_ids == self.config.image_token_index).sum().item()
+
+                    if isinstance(image_features, list):
+                        num_image_features = len(image_features)
+                    elif isinstance(image_features, torch.Tensor):
+                        num_image_features = image_features.shape[0]
+                    else:
+                        num_image_features = 0
+
+                    if total_image_tokens != num_image_features:
+                        # Skip image processing due to mismatch
+                        inputs_embeds = original_inputs_embeds
+                        attention_mask = original_attention_mask
+                        labels = original_labels
+                        position_ids = original_position_ids
+                        skip_image_merge = True
+                    else:
+                        skip_image_merge = False
+                else:
+                    skip_image_merge = False
+
+                # Attempt to merge image features if counts match
+                if not skip_image_merge:
+                    try:
+                        inputs_embeds, attention_mask, labels, position_ids = (
+                            self._merge_input_ids_with_image_features(
+                                image_features,
+                                inputs_embeds,
+                                input_ids,
+                                attention_mask,
+                                labels,
+                            ))
+                    except Exception:
+                        # Restore original inputs on failure
+                        inputs_embeds = original_inputs_embeds
+                        attention_mask = original_attention_mask
+                        labels = original_labels
+                        position_ids = original_position_ids
+
+                # Disable packed_seq_params if image processing actually happened
+                if packed_seq_params is not None and inputs_embeds is not original_inputs_embeds:
+                    packed_seq_params = None
 
             
-            if self.config.sequence_parallel:
-                inputs_embeds = tensor_parallel.scatter_to_sequence_parallel_region(inputs_embeds)
-                inputs_embeds = inputs_embeds.contiguous()
+            attention_mask = self._compute_attention_mask(input_ids)
 
+        # Ensure inputs_embeds is in [T, B, D] format (seq_len, batch, hidden)
+        if inputs_embeds.dim() == 3:
+            # Force [T, B, D] format for Megatron language model
+            # If current shape is [B, T, D], transpose to [T, B, D]
+            # If already [T, B, D], transposing twice returns to original
+            # This ensures consistent format regardless of input
+            # sys.stderr.write(f"[DEBUG Kimi K25 VL] Before transpose: inputs_embeds.shape={inputs_embeds.shape}\n")
+            # sys.stderr.flush()
+            inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+            # sys.stderr.write(f"[DEBUG Kimi K25 VL] After transpose: inputs_embeds.shape={inputs_embeds.shape}\n")
+            # sys.stderr.flush()
 
-        attention_mask = self._compute_attention_mask(input_ids)
+        if self.config.sequence_parallel:
+            # Import tensor parallel utilities to get tp size
+            try:
+                from megatron.core import mpu
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                tp_rank = mpu.get_tensor_model_parallel_rank()
+            except ImportError:
+                tp_size = dist.get_world_size()
+                tp_rank = dist.get_rank()
+
+            # sys.stderr.write(f"[DEBUG Kimi K25 VL] Rank {dist.get_rank()} (TP rank {tp_rank}): scatter_to_sequence_parallel_region - inputs_embeds.shape={inputs_embeds.shape}, tp_size={tp_size}, divisible? {inputs_embeds.shape[0] % tp_size == 0}\n")
+            # sys.stderr.flush()
+            # sys.stderr.write(f"[DEBUG Kimi K25 VL] Full shape info: dims={inputs_embeds.shape}, sequence_parallel={self.config.sequence_parallel}\n")
+            # sys.stderr.flush()
+
+            # Check and pad if needed before scattering
+            seq_len = inputs_embeds.shape[0]
+            if seq_len % tp_size != 0:
+                pad_needed = tp_size - (seq_len % tp_size)
+                # sys.stderr.write(f"[WARNING Kimi K25 VL] First dimension {seq_len} not divisible by tp_size {tp_size}. Padding with {pad_needed} zeros.\n")
+                # sys.stderr.flush()
+
+                # Pad inputs_embeds along sequence dimension (first dimension)
+                # inputs_embeds shape: [T, B, D]
+                inputs_embeds = torch.nn.functional.pad(
+                    inputs_embeds,
+                    (0, 0, 0, 0, 0, pad_needed),  # pad last dim (D), then second (B), then first (T)
+                    mode='constant',
+                    value=0
+                )
+                # sys.stderr.write(f"[DEBUG Kimi K25 VL] After padding: inputs_embeds.shape={inputs_embeds.shape}\n")
+                # sys.stderr.flush()
+
+                # IMPORTANT: If we have labels, attention_mask, position_ids, they also need padding
+                # However, in Kimi VL model, these might be handled by the language model internally
+                # We'll rely on the language model to handle padded inputs
+
+            inputs_embeds = tensor_parallel.scatter_to_sequence_parallel_region(inputs_embeds)
+            inputs_embeds = inputs_embeds.contiguous()
+            # sys.stderr.write(f"[DEBUG Kimi K25 VL] After scatter: shape={inputs_embeds.shape}\n")
+            # sys.stderr.flush()
 
         outputs = self.language_model.forward(
             input_ids=None,

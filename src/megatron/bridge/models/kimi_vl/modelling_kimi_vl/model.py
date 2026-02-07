@@ -158,6 +158,34 @@ class KimiVLModel(MegatronModule):
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
             if self.config.sequence_parallel:
+                # Check and pad if needed before scattering
+                try:
+                    from megatron.core import mpu
+                    tp_size = mpu.get_tensor_model_parallel_world_size()
+                except ImportError:
+                    # Fallback
+                    import torch.distributed as dist
+                    tp_size = dist.get_world_size()
+
+                seq_len = combined_embeddings.shape[0]
+                if seq_len % tp_size != 0:
+                    pad_needed = tp_size - (seq_len % tp_size)
+                    # Debug output
+                    import sys
+                    sys.stderr.write(f"[WARNING Kimi VL Model] Sequence length {seq_len} not divisible by tp_size {tp_size}. Padding with {pad_needed} zeros.\n")
+                    sys.stderr.flush()
+
+                    # Pad combined_embeddings along sequence dimension (first dimension)
+                    # combined_embeddings shape: [T, B, D]
+                    combined_embeddings = torch.nn.functional.pad(
+                        combined_embeddings,
+                        (0, 0, 0, 0, 0, pad_needed),  # pad last dim (D), then second (B), then first (T)
+                        mode='constant',
+                        value=0
+                    )
+                    sys.stderr.write(f"[DEBUG Kimi VL Model] After padding: combined_embeddings.shape={combined_embeddings.shape}\n")
+                    sys.stderr.flush()
+
                 combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeddings)
                 combined_embeddings = combined_embeddings.contiguous()
 

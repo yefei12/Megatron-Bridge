@@ -46,6 +46,7 @@ class KimiK25VLModelProvider(KimiK2Provider):
     scatter_embedding_sequence_parallel: bool = False
 
     def finalize(self) -> None:
+        # Disable automatic sequence parallel for VLM models
         if self.tensor_model_parallel_size > 1:
             self.sequence_parallel = True
 
