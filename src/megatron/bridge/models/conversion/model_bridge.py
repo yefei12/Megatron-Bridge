@@ -944,25 +944,25 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                 global_name_idx = global_names_index_dict[global_name]
                 mapping = mapping_registry.megatron_to_hf_lookup(self._get_lora_unwrapped_name(global_name))
 
-                if not mapping:
-                    logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
-                    continue
+                # if not mapping:
+                #     logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
+                #     continue
 
                 # ensure hf weights exist
-                if not mapping.allow_hf_name_mismatch:
-                    if isinstance(mapping.hf_param, str):
-                        if mapping.hf_param not in hf_keys:
-                            logger.warning(f"WARNING: Can't find {mapping.hf_param} in hf_keys")
-                            continue
-                    else:
-                        missing_params = [
-                            hf_param for hf_param in mapping.hf_param.values() if hf_param not in hf_keys
-                        ]
-                        if missing_params:
-                            logger.warning(
-                                f"WARNING: Can't find the following HF parameters in hf_keys: {missing_params}"
-                            )
-                            continue
+                # if not mapping.allow_hf_name_mismatch:
+                #     if isinstance(mapping.hf_param, str):
+                #         if mapping.hf_param not in hf_keys:
+                #             logger.warning(f"WARNING: Can't find {mapping.hf_param} in hf_keys")
+                #             continue
+                #     else:
+                #         missing_params = [
+                #             hf_param for hf_param in mapping.hf_param.values() if hf_param not in hf_keys
+                #         ]
+                #         if missing_params:
+                #             logger.warning(
+                #                 f"WARNING: Can't find the following HF parameters in hf_keys: {missing_params}"
+                #             )
+                #             continue
 
                 local_module, local_weights = get_module_and_param_from_name(megatron_model, local_name, vp_stage)
                 if local_module is not None and not hasattr(local_module, "config"):

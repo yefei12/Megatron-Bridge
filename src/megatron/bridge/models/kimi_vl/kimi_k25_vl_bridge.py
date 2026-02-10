@@ -1,17 +1,3 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import math
 
 import torch
@@ -75,29 +61,57 @@ class KimiK25VLBridge(MegatronModelBridge):
     def mapping_registry(self) -> MegatronMappingRegistry:
         # Return MegatronMappingRegistry containing parameter mappings from Megatron to HF format
         # First create simple 1:1 parameter mappings using a dictionary for readability
-        mapping_list = get_common_mapping_list()
+        """
+        Return MegatronMappingRegistry containing parameter mappings for MoE models.
+        The MoE mappings include:
+        1. Standard language model mappings (embeddings, layer norms, output)
+        2. Vision model mappings (same as dense model)
+        3. QKV mappings with QK layernorm
+        4. MoE-specific mappings:
+           - Router weights for expert selection
+           - Expert MLPs (multiple experts per layer)
+           - Pre-MLP layernorm
+        5. Deepstack visual merger mappings
+        Returns:
+            MegatronMappingRegistry with all MoE parameter mappings
+        """
+
+        hf_prefix = "language_model."
+
+        # Language model direct mappings (DeepSeek-style MLA/MoE)
         param_mappings = {
-            # expert bias
-            "decoder.layers.*.mlp.router.expert_bias": "model.layers.*.mlp.gate.e_score_correction_bias",
+            # Embeddings and output layers
+            "language_model.embedding.word_embeddings.weight": f"{hf_prefix}model.embed_tokens.weight",
+            "language_model.output_layer.weight": f"{hf_prefix}lm_head.weight",
+            "language_model.decoder.final_layernorm.weight": f"{hf_prefix}model.norm.weight",
+            # Layer normalization for attention
+            "language_model.decoder.layers.*.input_layernorm.weight": f"{hf_prefix}model.layers.*.input_layernorm.weight",
+            # MoE-specific: pre-MLP layernorm
+            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
+            # Attention output projection
+            "language_model.decoder.layers.*.self_attention.linear_proj.weight": f"{hf_prefix}model.layers.*.self_attn.o_proj.weight",
+            # MLA Q/KV projections
+            "language_model.decoder.layers.*.self_attention.linear_q_proj.weight": f"{hf_prefix}model.layers.*.self_attn.q_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_down_proj.weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.weight": f"{hf_prefix}model.layers.*.self_attn.kv_b_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.layer_norm_weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_layernorm.weight",
+            "language_model.decoder.layers.*.self_attention.kv_layernorm.weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_layernorm.weight",
+            # MoE router weights
+            "language_model.decoder.layers.*.mlp.router.weight": f"{hf_prefix}model.layers.*.mlp.gate.weight",
+            "language_model.decoder.layers.*.mlp.router.expert_bias": f"{hf_prefix}model.layers.*.mlp.gate.e_score_correction_bias",
+            # Dense/Shared experts down proj
+            "language_model.decoder.layers.*.mlp.linear_fc2.weight": f"{hf_prefix}model.layers.*.mlp.down_proj.weight",
+            "language_model.decoder.layers.*.mlp.shared_experts.linear_fc2.weight": f"{hf_prefix}model.layers.*.mlp.shared_experts.down_proj.weight",
         }
 
+        mapping_list = []
         for megatron_param, hf_param in param_mappings.items():
             mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
 
-        for mapping in mapping_list:
-            # in HF Kimi K2.5 VL models, language component is prefixed with "language_model.model" instead of "model"
-            if isinstance(mapping, AutoMapping):
-                mapping.hf_param = "language_model." + mapping.hf_param
-                mapping.megatron_param = "language_model." + mapping.megatron_param
-            elif isinstance(mapping, GatedMLPMapping):
-                mapping.megatron_param = mapping.megatron_param.replace("decoder", "language_model.decoder")
-                mapping.hf_param["gate"] = mapping.hf_param["gate"].replace("model", "language_model.model")
-                mapping.hf_param["up"] = mapping.hf_param["up"].replace("model", "language_model.model")
-
-
-        # Add Vision and MM Projector mappings
         mapping_list.extend(
             [
+                # Vision tower
                 ReplicatedMapping(
                     megatron_param="vision_tower.**",
                     hf_param="vision_tower.**",
@@ -105,6 +119,28 @@ class KimiK25VLBridge(MegatronModelBridge):
                 ReplicatedMapping(
                     megatron_param="mm_projector.**",
                     hf_param="mm_projector.**",
+                ),
+                # Dense MLP mappings (for non-MoE layers)
+                GatedMLPMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.linear_fc1.weight",
+                    gate=f"{hf_prefix}model.layers.*.mlp.gate_proj.weight",
+                    up=f"{hf_prefix}model.layers.*.mlp.up_proj.weight",
+                ),
+                # Expert MLP mappings (gate/up are separate in HF)
+                GatedMLPMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                    gate=f"{hf_prefix}model.layers.*.mlp.experts.*.gate_proj.weight",
+                    up=f"{hf_prefix}model.layers.*.mlp.experts.*.up_proj.weight",
+                ),
+                AutoMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                    hf_param=f"{hf_prefix}model.layers.*.mlp.experts.*.down_proj.weight",
+                ),
+                # Shared experts gate+up projections
+                GatedMLPMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
+                    gate=f"{hf_prefix}model.layers.*.mlp.shared_experts.gate_proj.weight",
+                    up=f"{hf_prefix}model.layers.*.mlp.shared_experts.up_proj.weight",
                 ),
             ]
         )
