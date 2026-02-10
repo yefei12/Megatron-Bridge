@@ -81,28 +81,46 @@ class KimiK25VLBridge(MegatronModelBridge):
         # Language model direct mappings (DeepSeek-style MLA/MoE)
         param_mappings = {
             # Embeddings and output layers
-            "language_model.embedding.word_embeddings.weight": f"{hf_prefix}model.embed_tokens.weight",
-            "language_model.output_layer.weight": f"{hf_prefix}lm_head.weight",
-            "language_model.decoder.final_layernorm.weight": f"{hf_prefix}model.norm.weight",
+            "language_model.embedding.word_embeddings.weight": 
+                f"{hf_prefix}model.embed_tokens.weight",
+            "language_model.output_layer.weight": 
+                f"{hf_prefix}lm_head.weight",
+            "language_model.decoder.final_layernorm.weight": 
+                f"{hf_prefix}model.norm.weight",
             # Layer normalization for attention
-            "language_model.decoder.layers.*.input_layernorm.weight": f"{hf_prefix}model.layers.*.input_layernorm.weight",
+            "language_model.decoder.layers.*.input_layernorm.weight": 
+                f"{hf_prefix}model.layers.*.input_layernorm.weight",
             # MoE-specific: pre-MLP layernorm
-            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
-            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": 
+                f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": 
+                f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
             # Attention output projection
-            "language_model.decoder.layers.*.self_attention.linear_proj.weight": f"{hf_prefix}model.layers.*.self_attn.o_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_proj.weight": 
+                f"{hf_prefix}model.layers.*.self_attn.o_proj.weight",
             # MLA Q/KV projections
-            "language_model.decoder.layers.*.self_attention.linear_q_proj.weight": f"{hf_prefix}model.layers.*.self_attn.q_proj.weight",
-            "language_model.decoder.layers.*.self_attention.linear_kv_down_proj.weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
-            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.weight": f"{hf_prefix}model.layers.*.self_attn.kv_b_proj.weight",
-            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.layer_norm_weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_layernorm.weight",
-            "language_model.decoder.layers.*.self_attention.kv_layernorm.weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_layernorm.weight",
+            "language_model.decoder.layers.*.self_attention.linear_q_down_proj.weight": 
+                f"{hf_prefix}model.layers.*.self_attn.q_a_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_q_up_proj.weight": 
+                f"{hf_prefix}model.layers.*.self_attn.q_b_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_q_up_proj.layer_norm_weight": 
+                f"{hf_prefix}model.layers.*.self_attn.q_a_layernorm.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_down_proj.weight": 
+                f"{hf_prefix}model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.weight": 
+                f"{hf_prefix}model.layers.*.self_attn.kv_b_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.layer_norm_weight": 
+                f"{hf_prefix}model.layers.*.self_attn.kv_a_layernorm.weight",
             # MoE router weights
-            "language_model.decoder.layers.*.mlp.router.weight": f"{hf_prefix}model.layers.*.mlp.gate.weight",
-            "language_model.decoder.layers.*.mlp.router.expert_bias": f"{hf_prefix}model.layers.*.mlp.gate.e_score_correction_bias",
+            "language_model.decoder.layers.*.mlp.router.weight": 
+                f"{hf_prefix}model.layers.*.mlp.gate.weight",
+            "language_model.decoder.layers.*.mlp.router.expert_bias": 
+                f"{hf_prefix}model.layers.*.mlp.gate.e_score_correction_bias",
             # Dense/Shared experts down proj
-            "language_model.decoder.layers.*.mlp.linear_fc2.weight": f"{hf_prefix}model.layers.*.mlp.down_proj.weight",
-            "language_model.decoder.layers.*.mlp.shared_experts.linear_fc2.weight": f"{hf_prefix}model.layers.*.mlp.shared_experts.down_proj.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc2.weight": 
+                f"{hf_prefix}model.layers.*.mlp.down_proj.weight",
+            "language_model.decoder.layers.*.mlp.shared_experts.linear_fc2.weight": 
+                f"{hf_prefix}model.layers.*.mlp.shared_experts.down_proj.weight",
         }
 
         mapping_list = []

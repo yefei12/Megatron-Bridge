@@ -944,9 +944,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                 global_name_idx = global_names_index_dict[global_name]
                 mapping = mapping_registry.megatron_to_hf_lookup(self._get_lora_unwrapped_name(global_name))
 
-                # if not mapping:
-                #     logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
-                #     continue
+                if not mapping:
+                    logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
+                    continue
 
                 # ensure hf weights exist
                 # if not mapping.allow_hf_name_mismatch:
