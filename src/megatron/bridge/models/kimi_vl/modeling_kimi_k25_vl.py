@@ -13,27 +13,17 @@
 # limitations under the License.
 
 import types
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear
-from megatron.core.transformer import TransformerConfig
+from megatron.core import InferenceParams, mpu, tensor_parallel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
-from megatron.bridge.utils.import_utils import safe_import_from
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core import InferenceParams, tensor_parallel
-
-
-TENorm, _ = safe_import_from("megatron.core.extensions.transformer_engine", "TENorm")
 
 
 class KimiK25VLModel(MegatronModule):
@@ -92,7 +82,8 @@ class KimiK25VLModel(MegatronModule):
         self.config.image_token_index: int = getattr(config, "image_token_index", 163605)
         self.config.pad_token_id: int = getattr(config, "pad_token_id", 163839)
         self.config.ignore_index: int = getattr(config, "ignore_index", -100)
-        
+        self.tp_size = mpu.get_tensor_model_parallel_world_size()
+
         KimiK25ForConditionalGeneration = get_class_from_dynamic_module(
             "modeling_kimi_k25.KimiK25ForConditionalGeneration",
             config.hf_model_path,
@@ -119,7 +110,7 @@ class KimiK25VLModel(MegatronModule):
             self.vision_tower_config = VisionTowerConfig(config.vision_config)
             self.projector_config = ProjectorConfig(config.vision_config)
             self.vision_tower = MoonViT3dPretrainedModel(self.vision_tower_config)
-            self.mm_projector = PatchMergerMLP(self.projector_config) # TODO: support different types of mm projector
+            self.mm_projector = PatchMergerMLP(self.projector_config)  # TODO: support different types of mm projector
             # Ensure HF visual tower params are marked for TP grad sync and future assignments are hooked.
             hook_hf_module_setattr_for_tp_grad_sync(self.vision_tower)
             hook_hf_module_setattr_for_tp_grad_sync(self.mm_projector)
@@ -133,7 +124,9 @@ class KimiK25VLModel(MegatronModule):
         self.shared_embedding_or_output_weight = self.language_model.shared_embedding_or_output_weight
 
         self._extract_image_features = types.MethodType(KimiK25ForConditionalGeneration._extract_image_features, self)
-        self._merge_input_ids_with_image_features = types.MethodType(KimiK25ForConditionalGeneration._merge_input_ids_with_image_features, self)
+        self._merge_input_ids_with_image_features = types.MethodType(
+            KimiK25ForConditionalGeneration._merge_input_ids_with_image_features, self
+        )
 
     def set_input_tensor(self, input_tensor) -> None:
         """Set model chunk input tensor."""
@@ -168,143 +161,134 @@ class KimiK25VLModel(MegatronModule):
             runtime_gather_output: If True, gather outputs across pipeline stages.
             loss_mask: Mask for loss computation.
         """
-        
         if position_ids is None:
+            batch_size = input_ids.size(0)
             seq_len = input_ids.size(1)
             position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+            attention_mask = torch.ones_like(input_ids, device=input_ids.device)
 
-        
         if self.pre_process:
             if inputs_embeds is None:
                 inputs_embeds = self.language_model.embedding(
                     input_ids=input_ids, position_ids=None
                 ).clone()  # [decoder_seq_len, b, h_language]
 
-                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # [b, decoder_seq_len, h_language]
-
             if pixel_values is not None:
+                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # [b, decoder_seq_len, h_language]
                 image_features = self._extract_image_features(pixel_values.to(self.vision_tower.dtype), grid_thws)
                 image_features = self.mm_projector(image_features)
+
                 inputs_embeds = inputs_embeds.to(image_features[0].dtype)
-
-                # Create backup of original inputs
-                original_inputs_embeds = inputs_embeds
-                original_attention_mask = attention_mask
-                original_labels = labels
-                original_position_ids = position_ids
-
-                # Check if image token count matches image feature count
-                if input_ids is not None:
-                    total_image_tokens = (input_ids == self.config.image_token_index).sum().item()
-
-                    if isinstance(image_features, list):
-                        num_image_features = len(image_features)
-                    elif isinstance(image_features, torch.Tensor):
-                        num_image_features = image_features.shape[0]
-                    else:
-                        num_image_features = 0
-
-                    if total_image_tokens != num_image_features:
-                        # Skip image processing due to mismatch
-                        inputs_embeds = original_inputs_embeds
-                        attention_mask = original_attention_mask
-                        labels = original_labels
-                        position_ids = original_position_ids
-                        skip_image_merge = True
-                    else:
-                        skip_image_merge = False
-                else:
-                    skip_image_merge = False
-
-                # Attempt to merge image features if counts match
-                if not skip_image_merge:
-                    try:
-                        inputs_embeds, attention_mask, labels, position_ids = (
-                            self._merge_input_ids_with_image_features(
-                                image_features,
-                                inputs_embeds,
-                                input_ids,
-                                attention_mask,
-                                labels,
-                            ))
-                    except Exception:
-                        # Restore original inputs on failure
-                        inputs_embeds = original_inputs_embeds
-                        attention_mask = original_attention_mask
-                        labels = original_labels
-                        position_ids = original_position_ids
-
-                # Disable packed_seq_params if image processing actually happened
-                if packed_seq_params is not None and inputs_embeds is not original_inputs_embeds:
-                    packed_seq_params = None
-
-            
-            attention_mask = self._compute_attention_mask(input_ids)
-
-        # Ensure inputs_embeds is in [T, B, D] format (seq_len, batch, hidden)
-        if inputs_embeds.dim() == 3:
-            # Force [T, B, D] format for Megatron language model
-            # If current shape is [B, T, D], transpose to [T, B, D]
-            # If already [T, B, D], transposing twice returns to original
-            # This ensures consistent format regardless of input
-            # sys.stderr.write(f"[DEBUG Kimi K25 VL] Before transpose: inputs_embeds.shape={inputs_embeds.shape}\n")
-            # sys.stderr.flush()
-            inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
-            # sys.stderr.write(f"[DEBUG Kimi K25 VL] After transpose: inputs_embeds.shape={inputs_embeds.shape}\n")
-            # sys.stderr.flush()
-
-        if self.config.sequence_parallel:
-            # Import tensor parallel utilities to get tp size
-            try:
-                from megatron.core import mpu
-                tp_size = mpu.get_tensor_model_parallel_world_size()
-                tp_rank = mpu.get_tensor_model_parallel_rank()
-            except ImportError:
-                tp_size = dist.get_world_size()
-                tp_rank = dist.get_rank()
-
-            # sys.stderr.write(f"[DEBUG Kimi K25 VL] Rank {dist.get_rank()} (TP rank {tp_rank}): scatter_to_sequence_parallel_region - inputs_embeds.shape={inputs_embeds.shape}, tp_size={tp_size}, divisible? {inputs_embeds.shape[0] % tp_size == 0}\n")
-            # sys.stderr.flush()
-            # sys.stderr.write(f"[DEBUG Kimi K25 VL] Full shape info: dims={inputs_embeds.shape}, sequence_parallel={self.config.sequence_parallel}\n")
-            # sys.stderr.flush()
-
-            # Check and pad if needed before scattering
-            seq_len = inputs_embeds.shape[0]
-            if seq_len % tp_size != 0:
-                pad_needed = tp_size - (seq_len % tp_size)
-                # sys.stderr.write(f"[WARNING Kimi K25 VL] First dimension {seq_len} not divisible by tp_size {tp_size}. Padding with {pad_needed} zeros.\n")
-                # sys.stderr.flush()
-
-                # Pad inputs_embeds along sequence dimension (first dimension)
-                # inputs_embeds shape: [T, B, D]
-                inputs_embeds = torch.nn.functional.pad(
+                inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                    image_features,
                     inputs_embeds,
-                    (0, 0, 0, 0, 0, pad_needed),  # pad last dim (D), then second (B), then first (T)
-                    mode='constant',
-                    value=0
+                    input_ids,
+                    attention_mask,
+                    labels,
                 )
-                # sys.stderr.write(f"[DEBUG Kimi K25 VL] After padding: inputs_embeds.shape={inputs_embeds.shape}\n")
-                # sys.stderr.flush()
 
-                # IMPORTANT: If we have labels, attention_mask, position_ids, they also need padding
-                # However, in Kimi VL model, these might be handled by the language model internally
-                # We'll rely on the language model to handle padded inputs
+                seq_len = inputs_embeds.shape[1]
+                _, embed_dim = image_features[0].shape
+                target_device = inputs_embeds.device
+                remainder = seq_len % self.tp_size
+                if remainder != 0:
+                    pad_len = self.tp_size - remainder
+                    inputs_embeds = torch.cat(
+                        [
+                            inputs_embeds,
+                            torch.zeros(
+                                batch_size, pad_len, embed_dim, device=target_device, dtype=inputs_embeds.dtype
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    attention_mask = torch.cat(
+                        [
+                            attention_mask,
+                            torch.zeros(batch_size, pad_len, device=target_device, dtype=attention_mask.dtype),
+                        ],
+                        dim=1,
+                    )
+                    position_ids = torch.cat(
+                        [
+                            position_ids,
+                            torch.zeros(batch_size, pad_len, device=target_device, dtype=position_ids.dtype),
+                        ],
+                        dim=1,
+                    )
+                    if labels is not None:
+                        labels = torch.cat(
+                            [
+                                labels,
+                                torch.full(
+                                    (batch_size, pad_len),
+                                    self.config.ignore_index,
+                                    device=target_device,
+                                    dtype=input_ids.dtype,
+                                ),
+                            ],
+                            dim=1,
+                        )
 
-            inputs_embeds = tensor_parallel.scatter_to_sequence_parallel_region(inputs_embeds)
-            inputs_embeds = inputs_embeds.contiguous()
-            # sys.stderr.write(f"[DEBUG Kimi K25 VL] After scatter: shape={inputs_embeds.shape}\n")
-            # sys.stderr.flush()
+                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()
+
+            if packed_seq_params is not None:
+                feature_lengths = [x.shape[0] for x in image_features]
+                cu_seqlens = (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else packed_seq_params.cu_seqlens_q
+                ).clone()
+
+                running_offset = 0
+                for idx, image_length in enumerate(feature_lengths):
+                    net_increment = image_length - 1
+                    running_offset += net_increment
+                    cu_seqlens[idx + 1] += running_offset
+
+                if len(cu_seqlens) > len(feature_lengths) + 1:
+                    for i in range(len(feature_lengths) + 1, len(cu_seqlens)):
+                        cu_seqlens[i] += running_offset
+
+                pad_len = cu_seqlens[-1] % self.tp_size
+                if pad_len != 0:
+                    pad_len = self.tp_size - pad_len
+                    last = cu_seqlens[-1] + pad_len
+                    last = last.to(device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+                    cu_seqlens = torch.cat([cu_seqlens[:-1], last.unsqueeze(0)])
+
+                diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+                packed_seq_params.max_seqlen_q = diffs.max().item()
+                packed_seq_params.max_seqlen_kv = packed_seq_params.max_seqlen_q
+                packed_seq_params.cu_seqlens_q = cu_seqlens
+                packed_seq_params.cu_seqlens_kv = cu_seqlens
+
+            if loss_mask is not None and pixel_values is not None:
+                new_seq_len, bs, _ = inputs_embeds.shape
+                original_seq_len = loss_mask.size(1)
+                net_image_increment = new_seq_len - original_seq_len
+                if net_image_increment > 0:
+                    image_start_idx = (input_ids == self.config.image_token_index).nonzero(as_tuple=True)[1][0].item()
+                    mask_prefix = loss_mask[:, :image_start_idx]
+                    mask_image = torch.zeros(
+                        bs, net_image_increment + 1, device=loss_mask.device, dtype=loss_mask.dtype
+                    )
+                    mask_suffix = loss_mask[:, image_start_idx + 1 :]
+                    loss_mask = torch.cat([mask_prefix, mask_image, mask_suffix], dim=1)
+
+            if self.config.sequence_parallel:
+                inputs_embeds = tensor_parallel.scatter_to_sequence_parallel_region(inputs_embeds)
 
         outputs = self.language_model.forward(
             input_ids=None,
             position_ids=position_ids,
-            attention_mask=attention_mask,  # (B, 1, T, T)
-            decoder_input=inputs_embeds,  # (T, B, D)
-            labels=labels,  # (B, T)
+            attention_mask=None,
+            decoder_input=inputs_embeds,
+            labels=labels,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             loss_mask=loss_mask,
-            **(extra_block_kwargs or {}),
+            runtime_gather_output=runtime_gather_output,
         )
         return outputs
 
@@ -327,37 +311,10 @@ class KimiK25VLModel(MegatronModule):
             # Vision model consists of patch_embed and blocks
             modules.append(self.vision_tower)
 
-        if (
-            freeze_vision_projection
-            and hasattr(self, "mm_projector")
-            and self.mm_projector is not None
-        ):
+        if freeze_vision_projection and hasattr(self, "mm_projector") and self.mm_projector is not None:
             # Vision projection is the merger module
             modules.append(self.mm_projector)
 
         for module in modules:
             for param in module.parameters():
                 param.requires_grad = False
-
-    def _compute_attention_mask(
-        self,
-        input_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not self.pre_process:
-            return None
-        batch_size, seq_len = input_ids.shape
-        causal_mask = torch.tril(torch.ones((batch_size, 1, seq_len, seq_len))).to(input_ids.device)
-
-        image_mask = input_ids == self.config.image_token_index
-        padded_mask = F.pad(image_mask, (1, 0), value=0)
-        boundary = padded_mask[:, 1:] > padded_mask[:, :-1]
-        numbered_boundary = torch.cumsum(boundary, dim=-1)
-        q_block_indices = image_mask * numbered_boundary
-        kv_block_indices = q_block_indices
-        bidirectional_mask = torch.logical_and(
-            kv_block_indices[:, None, :] == q_block_indices.unsqueeze(-1),
-            q_block_indices.unsqueeze(-1) > 0,
-        )
-        # See te.DotProductAttention for the requirement of custom mask
-        attention_mask = ~torch.logical_or(causal_mask, bidirectional_mask.unsqueeze(1))
-        return attention_mask

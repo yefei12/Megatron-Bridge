@@ -1,21 +1,32 @@
-import math
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 import torch
-from transformers import Gemma3ForConditionalGeneration
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
-    QKVMapping,
     ReplicatedMapping,
 )
+from megatron.bridge.models.deepseek.common import get_common_configs, get_common_mapping_list
 from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
 from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
-from megatron.bridge.models.deepseek.common import get_common_configs, get_common_mapping_list
+
 
 @MegatronModelBridge.register_bridge(source="KimiK25ForConditionalGeneration", target=KimiK25VLModel)
 class KimiK25VLBridge(MegatronModelBridge):
@@ -127,6 +138,17 @@ class KimiK25VLBridge(MegatronModelBridge):
         for megatron_param, hf_param in param_mappings.items():
             mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
 
+        for mapping in mapping_list:
+            # in HF Kimi K2.5 VL models, language component is prefixed with "language_model.model" instead of "model"
+            if isinstance(mapping, AutoMapping):
+                mapping.hf_param = "language_model." + mapping.hf_param
+                mapping.megatron_param = "language_model." + mapping.megatron_param
+            elif isinstance(mapping, GatedMLPMapping):
+                mapping.megatron_param = mapping.megatron_param.replace("decoder", "language_model.decoder")
+                mapping.hf_param["gate"] = mapping.hf_param["gate"].replace("model", "language_model.model")
+                mapping.hf_param["up"] = mapping.hf_param["up"].replace("model", "language_model.model")
+
+        # Add Vision and MM Projector mappings
         mapping_list.extend(
             [
                 # Vision tower
