@@ -12,24 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 
 import torch
-from transformers import Gemma3ForConditionalGeneration
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
-    QKVMapping,
     ReplicatedMapping,
 )
+from megatron.bridge.models.deepseek.common import get_common_configs, get_common_mapping_list
 from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
 from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
 from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
-from megatron.bridge.models.deepseek.common import get_common_configs, get_common_mapping_list
+
 
 @MegatronModelBridge.register_bridge(source="KimiK25ForConditionalGeneration", target=KimiK25VLModel)
 class KimiK25VLBridge(MegatronModelBridge):
@@ -93,7 +90,6 @@ class KimiK25VLBridge(MegatronModelBridge):
                 mapping.megatron_param = mapping.megatron_param.replace("decoder", "language_model.decoder")
                 mapping.hf_param["gate"] = mapping.hf_param["gate"].replace("model", "language_model.model")
                 mapping.hf_param["up"] = mapping.hf_param["up"].replace("model", "language_model.model")
-
 
         # Add Vision and MM Projector mappings
         mapping_list.extend(

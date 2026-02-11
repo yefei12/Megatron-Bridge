@@ -14,15 +14,13 @@
 
 
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Any, Optional
 
 from megatron.core.models.gpt import GPTModel
 
 from megatron.bridge.models.kimi.kimi_provider import KimiK2Provider
 from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
 from megatron.bridge.models.kimi_vl.modelling_kimi_vl.transfomer_config import DeepseekV3Config
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
 
 
 @dataclass
